@@ -1,0 +1,78 @@
+name: GigPilot Automation
+
+# 9:00 AM & 6:00 PM America/New_York.
+# GitHub cron is UTC-only and DST shifts the offset, so we fire at BOTH
+# possible UTC times for each local slot. The worker itself checks the
+# current New York local time and the unique per-slot run key, so the
+# "wrong offset" trigger and any delayed/duplicate trigger exit cleanly
+# without doing work (idempotent).
+on:
+  schedule:
+    - cron: "0 13 * * *"   # 9:00 AM EDT (UTC-4)
+    - cron: "0 14 * * *"   # 9:00 AM EST (UTC-5)
+    - cron: "0 22 * * *"   # 6:00 PM EDT
+    - cron: "0 23 * * *"   # 6:00 PM EST
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "manual"
+        type: choice
+        options: [manual, dry-run]
+
+concurrency:
+  group: gigpilot-automation
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run migrations
+        run: npm run db:migrate
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Run automation
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.mode }}" = "dry-run" ]; then
+              npm run agent:dry-run
+            else
+              npm run agent:manual
+            fi
+          else
+            npm run agent:hunt
+          fi
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FREELANCER_OAUTH_TOKEN: ${{ secrets.FREELANCER_OAUTH_TOKEN }}
+          UPWORK_ACCESS_TOKEN: ${{ secrets.UPWORK_ACCESS_TOKEN }}
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
+
+      - name: Alert on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode text="🚨 GigPilot GitHub Actions run FAILED: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null
+          fi
